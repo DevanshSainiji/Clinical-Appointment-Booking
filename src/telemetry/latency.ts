@@ -1,26 +1,24 @@
 type LatencyMark = {
-  speechEndMs?: number;
-  firstAudioByteMs?: number;
+  speechEndAt?: number;
+  firstAudioByteAt?: number;
 };
 
-const marks: LatencyMark = {};
+const marks = new Map<string, LatencyMark>();
 
-export function markSpeechEnd(nowMs: number): void {
-  marks.speechEndMs = nowMs;
+export function markSpeechEnd(sessionId: string): void {
+  const entry = marks.get(sessionId) || {};
+  entry.speechEndAt = Date.now();
+  marks.set(sessionId, entry);
 }
 
-export function markFirstAudioByte(nowMs: number): void {
-  marks.firstAudioByteMs = nowMs;
+export function markFirstAudioByte(sessionId: string): number | undefined {
+  const entry = marks.get(sessionId);
+  if (!entry?.speechEndAt) return undefined;
+  entry.firstAudioByteAt = Date.now();
+  return entry.firstAudioByteAt - entry.speechEndAt;
 }
 
-export function getEndToEndLatencyMs(): number | null {
-  if (marks.speechEndMs == null || marks.firstAudioByteMs == null) {
-    return null;
-  }
-  return marks.firstAudioByteMs - marks.speechEndMs;
+export function resetLatencyMarks(sessionId: string): void {
+  marks.delete(sessionId);
 }
 
-export function resetLatencyMarks(): void {
-  marks.speechEndMs = undefined;
-  marks.firstAudioByteMs = undefined;
-}
