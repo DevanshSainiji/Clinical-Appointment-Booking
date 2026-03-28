@@ -1,14 +1,16 @@
-import type { LanguageCode } from '../orchestration/orchestrator.js';
+import type { LanguageCode } from '../domain/clinic.js';
+import { logger } from '../telemetry/logger.js';
 
 export async function synthesizeSpeech(text: string, language: LanguageCode): Promise<Uint8Array> {
   const apiKey = process.env.SARVAM_API_KEY;
   if (!apiKey) {
-    console.warn("No SARVAM_API_KEY available for TTS.");
-    return new Uint8Array();
+    logger.error('tts', 'missing_api_key');
+    throw new Error('SARVAM_API_KEY is required for text-to-speech.');
   }
 
-  const targetCode = language === 'hi' ? 'hi-IN' : (language === 'ta' ? 'ta-IN' : 'en-IN');
-  
+  const targetLanguageCode = language === 'hi' ? 'hi-IN' : language === 'ta' ? 'ta-IN' : 'en-IN';
+  logger.info('tts', 'request_start', { language, targetLanguageCode, textPreview: text.slice(0, 200) });
+
   const response = await fetch('https://api.sarvam.ai/text-to-speech', {
     method: 'POST',
     headers: {
@@ -17,26 +19,25 @@ export async function synthesizeSpeech(text: string, language: LanguageCode): Pr
     },
     body: JSON.stringify({
       inputs: [text],
-      target_language_code: targetCode,
-      speaker: language === 'en' ? "anushka" : "amartya",
-      pitch: 0,
-      pace: 1.0,
-      loudness: 1.5,
+      target_language_code: targetLanguageCode,
+      pace: 1,
       speech_sample_rate: 8000,
       enable_preprocessing: true,
-      model: "bulbul:v3"
     }),
   });
 
-  if (response.ok) {
-    const data = await response.json();
-    if (data.audios && data.audios.length > 0) {
-      const b64 = data.audios[0];
-      return Buffer.from(b64, 'base64');
-    }
-  } else {
-    console.error("Sarvam TTS returned an error status:", response.status, await response.text());
+  if (!response.ok) {
+    logger.error('tts', 'request_failed', { status: response.status });
+    throw new Error(`Sarvam TTS failed: ${response.status} ${await response.text()}`);
   }
 
-  return new Uint8Array();
+  const data = (await response.json()) as { audios?: string[] };
+  const audio = data.audios?.[0];
+  if (!audio) {
+    logger.error('tts', 'empty_audio');
+    throw new Error('Sarvam TTS returned no audio data.');
+  }
+
+  logger.info('tts', 'request_complete', { bytes: Buffer.from(audio, 'base64').byteLength });
+  return Buffer.from(audio, 'base64');
 }
