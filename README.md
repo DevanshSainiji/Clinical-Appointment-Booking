@@ -24,6 +24,79 @@ This repository contains a clean TypeScript implementation for the engineering a
 - **Why two memory layers:** Session memory handles in-progress dialogue state; long-term memory stores patient history and preferences across calls. This separation prevents prompt bloat and keeps retrieval scoped.
 - **Why trace-first orchestration:** Every tool decision is logged so behavior is explainable during demo and review, not treated as a black box.
 
+```mermaid
+flowchart LR
+  U["User / Patient"] --> P["LiveKit Agents Playground<br/>or local UI"]
+  P --> LK["LiveKit Cloud Room"]
+
+  subgraph API["API / Control Plane"]
+    S["src/server.ts<br/>Token + Dispatch + Reset API"]
+    C[".env / config"]
+  end
+
+  subgraph Worker["Voice Worker"]
+    W["src/main.ts<br/>Boot + LiveKit worker"]
+    VA["src/runtime/voiceAgent.ts<br/>VAD → STT → Orchestrate → TTS"]
+    STT["src/services/stt.ts<br/>Sarvam STT"]
+    TR["src/services/translation.ts<br/>Hindi/Tamil → English for reasoning"]
+    TTS["src/services/tts.ts<br/>Sarvam TTS"]
+    OR["src/orchestration/orchestrator.ts<br/>Intent + tools + demo flow"]
+    DP["src/orchestration/dialogueManager.ts<br/>Session state"]
+    IR["src/orchestration/intentRouter.ts<br/>Language + intent detection"]
+    RP["src/orchestration/requestParser.ts<br/>Doctor/date parsing"]
+  end
+
+  subgraph Memory["Memory / Data"]
+    LS["src/storage/clinicStore.ts<br/>Clinic JSON store"]
+    LM["src/memory/longTermMemory.ts<br/>Patient profile + summaries"]
+    SM["src/memory/sessionMemory.ts<br/>Session state"]
+    DB["data/clinic-store.json"]
+  end
+
+  subgraph Tools["Clinic Tools"]
+    GP["getPatientProfile"]
+    GS["getScheduleOptions"]
+    MA["manageAppointment"]
+  end
+
+  subgraph Telemetry["Telemetry"]
+    LOG["src/telemetry/logger.ts"]
+    LT["src/telemetry/latency.ts"]
+    TRC["src/telemetry/traces.ts"]
+  end
+
+  S --> LK
+  P --> S
+  LK --> W
+  W --> VA
+  VA --> STT
+  VA --> TR
+  VA --> OR
+  OR --> IR
+  OR --> RP
+  OR --> DP
+  OR --> GP
+  OR --> GS
+  OR --> MA
+  OR --> LM
+  OR --> SM
+  LM --> LS
+  SM --> LS
+  LS --> DB
+
+  VA --> TTS
+  VA --> LOG
+  VA --> LT
+  VA --> TRC
+
+  C --> S
+  C --> W
+  C --> STT
+  C --> TTS
+  C --> OR
+
+```
+
 ## Current Architecture
 
 ```txt
