@@ -4,8 +4,13 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
+    "dev": "concurrently -n server,worker,web -c auto \"pnpm start:server\" \"pnpm start\" \"pnpm dev:web\"",
+    "dev:web": "pnpm -C apps/playground dev",
     "build": "tsc -p tsconfig.app.json",
     "start": "node dist/main.js dev",
+    "start:worker": "node dist/main.js dev",
+    "start:server": "node dist/server.js",
+    "diag:sarvam": "node dist/diagnostics/sarvam.js",
     "check": "tsc -p tsconfig.app.json --noEmit"
   },
   "dependencies": {
@@ -17,13 +22,26 @@
     "@livekit/agents-plugin-sarvam": "^1.2.1",
     "@livekit/agents-plugin-silero": "^1.2.1",
     "@livekit/rtc-node": "^0.13.24",
+    "cors": "^2.8.5",
     "dotenv": "^17.3.1",
+    "express": "^4.21.2",
     "livekit-server-sdk": "^2.15.0",
-    "mongoose": "^9.3.3",
     "wavefile": "^11.0.0"
   },
   "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^4.17.23",
     "@types/node": "^24.12.0",
+    "concurrently": "^9.2.1",
     "typescript": "~5.9.3"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "onnxruntime-node",
+      "sharp",
+      "protobufjs",
+      "@ffmpeg-installer/darwin-arm64"
+    ]
   }
 }
