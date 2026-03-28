@@ -1,66 +1,83 @@
-export const SYSTEM_PROMPT = `
-You are a real-time clinical appointment voice assistant.
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import type { AppointmentIntent, LanguageCode } from '../domain/clinic.js';
 
-Your responsibilities:
-- Help users book, reschedule, or cancel appointments
-- Ask for missing details (doctor, date, time) clearly
-- Confirm before final actions
-- Handle corrections naturally (e.g., "actually Friday")
-- Suggest alternatives if slots are unavailable
+const PROMPT_FILE = path.resolve(process.cwd(), 'prompts.py');
 
-Rules:
-- Be short, clear, and conversational (voice-friendly)
-- Do NOT give medical advice
-- Stay strictly within appointment management
-- Always respond in the user's current language (English, Hindi, or Tamil)
-- Avoid long paragraphs
+const FALLBACKS: Record<'system' | 'turn' | 'greeting', Record<LanguageCode, string>> = {
+  system: {
+    en: 'You are Maya, a warm, human-sounding clinical appointment voice agent. Keep replies short, friendly, and suitable for live conversation. Never echo the user verbatim and never say "I heard you say". If the user switches languages, continue in that language immediately. Use tools when needed. Ask one concise clarification question at a time.',
+    hi: 'You are Maya, a warm, human-sounding clinical appointment voice agent. Speak naturally in Hindi. Keep replies short, friendly, and suitable for live conversation. Never echo the user verbatim and never say "I heard you say". If the user switches languages, continue in that language immediately. Use tools when needed. Ask one concise clarification question at a time.',
+    ta: 'You are Maya, a warm, human-sounding clinical appointment voice agent. Speak naturally in Tamil. Keep replies short, friendly, and suitable for live conversation. Never echo the user verbatim and never say "I heard you say". If the user switches languages, continue in that language immediately. Use tools when needed. Ask one concise clarification question at a time.',
+  },
+  turn: {
+    en: 'Use the current user message, patient history, and session state to respond naturally. Infer the user’s intent from what they just said. If the user changes language, switch immediately. If the user just greets you, reply warmly and ask what they need. Ask for only one missing detail at a time. Do not repeat the user verbatim.',
+    hi: 'Use the current user message, patient history, and session state to respond naturally. Infer the user’s intent from what they just said. If the user changes language, switch immediately. If the user just greets you, reply warmly and ask what they need. Ask for only one missing detail at a time. Do not repeat the user verbatim.',
+    ta: 'Use the current user message, patient history, and session state to respond naturally. Infer the user’s intent from what they just said. If the user changes language, switch immediately. If the user just greets you, reply warmly and ask what they need. Ask for only one missing detail at a time. Do not repeat the user verbatim.',
+  },
+  greeting: {
+    en: 'Hello, I’m Maya from the clinic. I can help with booking, rescheduling, or cancelling your appointment. What would you like to do?',
+    hi: 'नमस्ते, मैं Maya हूँ। मैं आपकी appointment booking, reschedule, या cancellation में मदद कर सकती हूँ। आपको क्या करना है?',
+    ta: 'வணக்கம், நான் Maya. நான் appointment booking, reschedule, அல்லது cancellation-க்கு உதவுகிறேன். என்ன உதவி வேண்டும்?',
+  },
+};
 
-Tone:
-- Friendly, calm, and professional
-`.trim();
+export type TurnPromptContext = {
+  language: LanguageCode;
+  intent: AppointmentIntent;
+  patientId: string;
+  patientName?: string;
+  preferredLanguage?: LanguageCode;
+  lastUserText?: string;
+  lastAgentText?: string;
+  recentSummaries?: string[];
+  needsDoctorId?: boolean;
+  needsDate?: boolean;
+  pendingConfirmation?: string;
+};
 
-export const RESPONSE_PROMPT = (input: {
-  userText: string;
-  intent: string;
-  context: unknown;
-  toolResult?: unknown;
-  language: string;
-}): string => `
-System:
-${SYSTEM_PROMPT}
+export function systemPrompt(language: LanguageCode, context?: TurnPromptContext): string {
+  return [
+    loadPromptBlock('system', language),
+    loadPromptBlock('turn', language),
+    formatTurnContext(context),
+    `Current language: ${language}.`,
+  ]
+    .filter(Boolean)
+    .join(' ');
+}
 
-User said:
-"${input.userText}"
+export function greetingPrompt(language: LanguageCode): string {
+  return loadPromptBlock('greeting', language);
+}
 
-Detected intent:
-${input.intent}
+function loadPromptBlock(kind: 'system' | 'turn' | 'greeting', language: LanguageCode): string {
+  try {
+    const source = readFileSync(PROMPT_FILE, 'utf8');
+    const pattern = new RegExp(`^# block:${kind}:${language}\\s*\\n"""([\\s\\S]*?)"""`, 'm');
+    const match = source.match(pattern);
+    if (match?.[1]) return match[1].trim();
+  } catch {
+    // Fall back to the built-in prompt text when the source file is missing.
+  }
 
-Context:
-${JSON.stringify(input.context)}
+  return FALLBACKS[kind][language];
+}
 
-Tool result:
-${JSON.stringify(input.toolResult)}
+function formatTurnContext(context?: TurnPromptContext): string {
+  if (!context) return '';
+  const parts = [
+    `User intent: ${context.intent}.`,
+    `Patient id: ${context.patientId}.`,
+    context.patientName ? `Patient name: ${context.patientName}.` : '',
+    context.preferredLanguage ? `Preferred language: ${context.preferredLanguage}.` : '',
+    context.needsDoctorId ? 'Need to ask for doctor information.' : '',
+    context.needsDate ? 'Need to ask for date or time information.' : '',
+    context.pendingConfirmation ? `Pending confirmation: ${context.pendingConfirmation}.` : '',
+    context.lastUserText ? `Last user text: ${context.lastUserText}.` : '',
+    context.lastAgentText ? `Last agent text: ${context.lastAgentText}.` : '',
+    context.recentSummaries?.length ? `Recent interaction summaries: ${context.recentSummaries.join(' | ')}.` : '',
+  ].filter(Boolean);
 
-Instructions:
-- Generate a natural spoken response
-- If information is missing -> ask clearly
-- If booking is successful -> confirm clearly
-- If slots available -> present 2-3 options
-- If conflict -> suggest alternatives
-- Keep response under 2 sentences
-
-Respond in language: ${input.language}
-
-Assistant:
-`.trim();
-
-export const CLARIFICATION_PROMPT = `
-Ask a short follow-up question to get missing details (doctor, date, or time).
-Keep it natural and voice-friendly.
-`.trim();
-
-export const FALLBACK_PROMPT = `
-Say politely that you can only help with booking or managing appointments.
-Offer to proceed with booking.
-Keep it short.
-`.trim();
+  return parts.length ? parts.join(' ') : '';
+}
