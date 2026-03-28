@@ -1,34 +1,21 @@
-import type { LanguageCode } from '../orchestration/intentRouter.js';
-import { PatientModel } from '../models/patient.model.js';
+import { getPatientProfile, getInteractionSummaries } from '../memory/longTermMemory.js';
+import type { ToolResult } from '../domain/clinic.js';
+import { logger } from '../telemetry/logger.js';
 
-export type PatientProfile = {
-  patientId: string;
-  name: string;
-  preferredLanguage: LanguageCode;
-  activeAppointmentId?: string;
-};
-
-export async function getPatientProfile(patientId: string): Promise<PatientProfile> {
-  try {
-    const patient = await PatientModel.findOne({ patientId }).lean();
-    if (!patient) {
-      return {
-        patientId,
-        name: 'Guest Patient',
-        preferredLanguage: 'en',
-      };
-    }
-
-    return {
-      patientId,
-      name: patient.name ?? 'Guest Patient',
-      preferredLanguage: (patient.preferredLanguage ?? 'en') as LanguageCode,
-    };
-  } catch {
-    return {
-      patientId,
-      name: 'Guest Patient',
-      preferredLanguage: 'en',
-    };
-  }
+export async function getPatientProfileTool(input: { patientId: string }): Promise<ToolResult> {
+  logger.info('tool', 'get_patient_profile_start', { patientId: input.patientId });
+  const profile = await getPatientProfile(input.patientId);
+  const history = await getInteractionSummaries(input.patientId);
+  logger.info('tool', 'get_patient_profile_end', {
+    patientId: input.patientId,
+    recentInteractions: history.length,
+  });
+  return {
+    ok: true,
+    message: `Loaded patient profile for ${profile.name}.`,
+    data: {
+      profile,
+      recentInteractions: history,
+    },
+  };
 }
