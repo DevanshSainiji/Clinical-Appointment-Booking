@@ -1,25 +1,26 @@
 import { runOrchestrationTurn } from '../orchestration/orchestrator.js';
+import { detectLanguage } from '../orchestration/intentRouter.js';
+import { greetingPrompt } from '../config/prompts.js';
 import { transcribeAudio } from '../services/stt.js';
 import { synthesizeSpeech } from '../services/tts.js';
+import { translateForReasoning } from '../services/translation.js';
 import { markFirstAudioByte, markSpeechEnd, resetLatencyMarks } from '../telemetry/latency.js';
-import { Room, RoomEvent, type Participant, AudioSource, LocalAudioTrack, AudioStream, AudioFrame } from '@livekit/rtc-node';
-import { AccessToken } from 'livekit-server-sdk';
+import { recordReasoningTrace } from '../telemetry/traces.js';
+import { logger } from '../telemetry/logger.js';
+import { Room, RoomEvent, type Participant, AudioSource, LocalAudioTrack, AudioStream, AudioFrame, TrackPublishOptions, TrackSource } from '@livekit/rtc-node';
+import { VAD, type VADStream } from '@livekit/agents-plugin-silero';
 import { VADEventType } from '@livekit/agents';
-import { VAD } from '@livekit/agents-plugin-silero';
 import pkg from 'wavefile';
+
 const { WaveFile } = pkg;
 
-type LiveKitConfig = {
-  url: string;
-  apiKey: string;
-  apiSecret: string;
-  roomName: string;
-};
-
-export type VoiceTurnResult = {
+type TurnPayload = {
   transcript: string;
   responseText: string;
   audio: Uint8Array;
+  language: 'en' | 'hi' | 'ta';
+  ttfbMs: number;
+  toolCalls: Array<{ name: string; input: unknown; result: unknown }>;
 };
 
 export class VoiceAgent {
@@ -27,227 +28,434 @@ export class VoiceAgent {
   private audioSource: AudioSource | null = null;
   private agentPlaying = false;
   private greetingSent = false;
+  private playbackChain: Promise<void> = Promise.resolve();
 
   async startWithRoom(room: Room): Promise<void> {
     this.room = room;
-
+    logger.info('voice', 'room_start', { room: room.name, remoteParticipants: room.remoteParticipants.size });
     this.audioSource = new AudioSource(24000, 1);
-    const track = LocalAudioTrack.createAudioTrack('agent-mic', this.audioSource);
-    await room.localParticipant?.publishTrack(track, { name: 'agent-mic' } as any);
-
-    console.info(`LiveKit agent joined room "${room.name}"`);
-
-    room.on(RoomEvent.ChatMessage, async (message, participant) => {
-      await this.handleChatMessage(message.message, participant);
-    });
-
-    room.on(RoomEvent.DataReceived, async (payload, participant, _kind, topic) => {
-      const maybeTranscript = this.extractTranscriptFromData(payload, topic);
-      if (maybeTranscript) {
-        await this.handleChatMessage(maybeTranscript, participant);
-      }
-    });
+    const track = LocalAudioTrack.createAudioTrack('maya-speaker', this.audioSource);
+    if (!room.localParticipant) {
+      throw new Error('LiveKit room has no local participant.');
+    }
+    const publishOptions = new TrackPublishOptions();
+    publishOptions.source = TrackSource.SOURCE_MICROPHONE;
+    await room.localParticipant.publishTrack(track, publishOptions);
+    logger.info('voice', 'audio_track_published', { room: room.name, trackName: 'maya-speaker' });
 
     room.on(RoomEvent.ParticipantConnected, (participant) => {
-      console.log(`[Room] Participant connected: ${participant.identity}`);
+      logger.info('voice', 'participant_connected', {
+        room: room.name,
+        participantIdentity: participant.identity,
+        participantName: participant.name || null,
+      });
       if (!this.greetingSent) {
         this.greetingSent = true;
-        this.triggerGreeting(participant).catch(console.error);
+        this.greet(participant).catch(console.error);
       }
     });
 
     room.on(RoomEvent.TrackSubscribed, (track, _pub, participant) => {
-      console.log(`[Audio Pipeline] Track subscribed: kind=${track.kind} from pt=${participant.identity}`);
+      logger.info('voice', 'track_subscribed', {
+        room: room.name,
+        participantIdentity: participant.identity,
+        kind: track.kind,
+      });
+      if (track.kind === 1) {
+        this.handleParticipantAudio(track as any, participant).catch(console.error);
+      }
+    });
 
-      if (track.kind === 1) { // 1 = Audio
-        this.handleAudioStream(track as any, participant).catch(console.error);
+    room.on(RoomEvent.ChatMessage, async (message, participant) => {
+      logger.info('voice', 'chat_message', {
+        room: room.name,
+        participantIdentity: participant?.identity || null,
+        preview: message.message.slice(0, 200),
+      });
+      await this.handleTextTurn(message.message, participant);
+    });
+
+    room.on(RoomEvent.DataReceived, async (payload, participant, _kind, topic) => {
+      logger.debug('voice', 'data_received', {
+        room: room.name,
+        participantIdentity: participant?.identity || null,
+        topic: topic || null,
+        bytes: payload.byteLength,
+      });
+      if (topic?.includes('transcript') || topic?.includes('chat') || topic?.includes('text')) {
+        const raw = new TextDecoder().decode(payload).trim();
+        if (raw) await this.handleTextTurn(raw, participant);
       }
     });
 
     room.on(RoomEvent.Disconnected, (reason) => {
-      console.warn(`LiveKit disconnected: ${reason}`);
+      logger.warn('voice', 'room_disconnected', { room: room.name, reason });
     });
 
-    // If a participant is already in the room when the agent joins via the Playground dispatch
     if (room.remoteParticipants.size > 0 && !this.greetingSent) {
-      const firstParticipant = Array.from(room.remoteParticipants.values())[0];
-      if (firstParticipant) {
+      const first = Array.from(room.remoteParticipants.values())[0];
+      if (first) {
         this.greetingSent = true;
-        this.triggerGreeting(firstParticipant).catch(console.error);
+        this.greet(first).catch(console.error);
       }
     }
+
+    logger.info('voice', 'agent_joined_room', { room: room.name });
   }
 
-  private async handleAudioStream(track: any, participant: Participant) {
+  private async handleParticipantAudio(track: any, participant: Participant): Promise<void> {
+    logger.info('voice', 'audio_stream_start', {
+      room: this.room?.name || null,
+      participantIdentity: participant.identity,
+    });
     const stream = new AudioStream(track);
     const vad = await VAD.load();
     const vadStream = vad.stream();
-
-    let isSpeaking = false;
-    let audioFrames: AudioFrame[] = [];
-
     const reader = stream.getReader();
 
-    // Asynchronously push frames from LiveKit incoming stream to VAD
-    (async () => {
+    const buffer: AudioFrame[] = [];
+    let speaking = false;
+
+    const pump = (async () => {
       while (true) {
         const { done, value } = await reader.read();
         if (done || !value) break;
         vadStream.pushFrame(value);
-        if (isSpeaking && !this.agentPlaying) {
-          audioFrames.push(value);
-        }
+        if (speaking && !this.agentPlaying) buffer.push(value);
       }
     })();
 
-    // Listen to VAD events and chunk
     for await (const event of vadStream) {
       if (event.type === VADEventType.START_OF_SPEECH) {
         if (!this.agentPlaying) {
-          console.log(`[VAD] Start of speech detected from ${participant.identity}`);
-          isSpeaking = true;
-          audioFrames = [];
+          logger.debug('voice', 'vad_start_of_speech', {
+            participantIdentity: participant.identity,
+            room: this.room?.name || null,
+          });
+          speaking = true;
+          buffer.length = 0;
         }
-      } else if (event.type === VADEventType.END_OF_SPEECH) {
-        console.log(`[VAD] End of speech detected. Collected ${audioFrames.length} frames.`);
-        isSpeaking = false;
+      }
 
-        if (audioFrames.length > 5) {
-          console.log(`[Audio Pipeline] Stitching WAV buffer from frames...`);
-          const combined = this.combineFrames(audioFrames);
-          const wav = new WaveFile();
-          wav.fromScratch(1, combined.sampleRate, '16', combined.data);
-          const wavBuffer = wav.toBuffer();
-
-          const sessionId = `${this.room!.name}:${participant.identity}`;
-          console.log(`[Audio Pipeline] Dispatching audio to STT...`);
-          const turnStartTime = Date.now();
-          this.processAudioTurn(wavBuffer, sessionId, participant.identity)
-            .then(result => {
-              const latencyMs = Date.now() - turnStartTime;
-              console.log(`[Latency] End-to-end TTFB: ${latencyMs}ms`);
-              console.log(`[Audio Pipeline] Playing audio response...`);
-              return this.playAudio(result.audio);
-            })
-            .catch(e => console.error("[Error] Processing audio turn failed", e));
+      if (event.type === VADEventType.END_OF_SPEECH) {
+        logger.debug('voice', 'vad_end_of_speech', {
+          participantIdentity: participant.identity,
+          collectedFrames: buffer.length,
+          room: this.room?.name || null,
+        });
+        speaking = false;
+        if (buffer.length > 5) {
+          const wav = this.framesToWav(buffer);
+          buffer.length = 0;
+          this.processAudioTurn(wav, participant).catch(console.error);
         }
-        audioFrames = [];
       }
     }
+
+    await pump;
   }
 
-  private combineFrames(frames: AudioFrame[]): { data: Int16Array, sampleRate: number } {
-    const totalLength = frames.reduce((acc, f) => acc + (f.data.byteLength / 2), 0);
-    const combinedData = new Int16Array(totalLength);
-    let offset = 0;
-    for (const f of frames) {
-      const pcm16 = new Int16Array(f.data.buffer, f.data.byteOffset, f.data.byteLength / 2);
-      combinedData.set(pcm16, offset);
-      offset += pcm16.length;
+  private async handleTextTurn(text: string, participant?: Participant): Promise<void> {
+    if (!this.room?.localParticipant || !participant || !text.trim()) return;
+    if (participant.identity === this.room.localParticipant.identity) return;
+
+    const detectedLanguage = detectLanguage(text);
+    const normalized = await translateForReasoning(text.trim(), detectedLanguage);
+    logger.info('voice', 'text_turn_start', {
+      room: this.room.name,
+      participantIdentity: participant.identity,
+      textPreview: text.trim().slice(0, 200),
+      detectedLanguage,
+      normalizedPreview: normalized.translatedText.slice(0, 200),
+    });
+
+    if (isLowValueTranscript(text, undefined)) {
+      logger.debug('voice', 'text_turn_ignored', {
+        room: this.room.name,
+        participantIdentity: participant.identity,
+        reason: 'low_value_transcript',
+        transcript: text.trim(),
+      });
+      await this.askToRepeat(participant, detectedLanguage, 'text');
+      return;
     }
-    return { data: combinedData, sampleRate: frames[0].sampleRate };
+
+    const turn = await runOrchestrationTurn({
+      sessionId: `${this.room.name}:${participant.identity}`,
+      patientId: participant.identity,
+      userText: text.trim(),
+      normalizedUserText: normalized.translatedText,
+      language: normalizeLanguage(participant.attributes?.language) || detectedLanguage,
+    });
+
+    await this.room.localParticipant.sendChatMessage(turn.responseText, [participant.identity]);
+    logger.info('voice', 'text_turn_complete', {
+      room: this.room.name,
+      participantIdentity: participant.identity,
+      responsePreview: turn.responseText.slice(0, 200),
+      toolCalls: turn.toolCalls.map((tool) => tool.name),
+    });
+    await this.publishTrace({
+      kind: 'text-turn',
+      patientId: participant.identity,
+      sessionId: `${this.room.name}:${participant.identity}`,
+      transcript: text.trim(),
+      normalizedTranscript: normalized.translatedText,
+      responseText: turn.responseText,
+      toolCalls: turn.toolCalls.map((tool) => tool.name),
+      ttfbMs: undefined,
+      timestampIso: new Date().toISOString(),
+      language: turn.language,
+    });
   }
 
-  private async playAudio(ttsBuffer: Uint8Array) {
+  private async processAudioTurn(audio: Uint8Array, participant: Participant): Promise<void> {
+    if (!this.room?.localParticipant) return;
+
+    const sessionId = `${this.room.name}:${participant.identity}`;
+    logger.info('voice', 'audio_turn_start', {
+      room: this.room.name,
+      participantIdentity: participant.identity,
+      sessionId,
+      audioBytes: audio.byteLength,
+    });
+    resetLatencyMarks(sessionId);
+    markSpeechEnd(sessionId);
+
+    const sttStart = Date.now();
+    const transcription = await transcribeAudio(audio);
+    const normalized = await translateForReasoning(transcription.text, transcription.language);
+    logger.info('voice', 'stt_complete', {
+      sessionId,
+      participantIdentity: participant.identity,
+      ms: Date.now() - sttStart,
+      transcriptPreview: transcription.text.slice(0, 200),
+      language: transcription.language,
+      confidence: transcription.confidence ?? null,
+      normalizedPreview: normalized.translatedText.slice(0, 200),
+    });
+
+    if (isLowValueTranscript(transcription.text, transcription.confidence)) {
+      logger.warn('voice', 'audio_turn_ignored', {
+        sessionId,
+        participantIdentity: participant.identity,
+        transcript: transcription.text,
+        confidence: transcription.confidence ?? null,
+        language: transcription.language,
+      });
+      await this.askToRepeat(participant, transcription.language, 'audio');
+      await this.publishTrace({
+        kind: 'audio-turn',
+        sessionId,
+        patientId: participant.identity,
+        transcript: transcription.text,
+        normalizedTranscript: normalized.translatedText,
+        responseText: '',
+        toolCalls: [],
+        ttfbMs: undefined,
+        timestampIso: new Date().toISOString(),
+        language: transcription.language,
+        ignored: true,
+        reason: 'low_value_transcript',
+      });
+      return;
+    }
+
+    const orchestrationStart = Date.now();
+    const orchestration = await runOrchestrationTurn({
+      sessionId,
+      patientId: participant.identity,
+      userText: transcription.text,
+      normalizedUserText: normalized.translatedText,
+      language: transcription.language,
+    });
+    logger.info('voice', 'orchestration_complete', {
+      sessionId,
+      participantIdentity: participant.identity,
+      ms: Date.now() - orchestrationStart,
+      intent: orchestration.intent,
+      responsePreview: orchestration.responseText.slice(0, 200),
+      toolCalls: orchestration.toolCalls.map((tool) => tool.name),
+    });
+
+    const ttsStart = Date.now();
+    const speech = await synthesizeSpeech(orchestration.responseText, orchestration.language);
+    logger.info('voice', 'tts_complete', {
+      sessionId,
+      participantIdentity: participant.identity,
+      ms: Date.now() - ttsStart,
+      audioBytes: speech.byteLength,
+    });
+    const ttfbMs = markFirstAudioByte(sessionId) ?? 0;
+    const payload: TurnPayload = {
+      transcript: transcription.text,
+      responseText: orchestration.responseText,
+      audio: speech,
+      language: orchestration.language,
+      ttfbMs,
+      toolCalls: orchestration.toolCalls,
+    };
+
+    await this.publishTrace({
+      kind: 'audio-turn',
+      sessionId,
+      patientId: participant.identity,
+      transcript: payload.transcript,
+      normalizedTranscript: normalized.translatedText,
+      responseText: payload.responseText,
+      toolCalls: payload.toolCalls.map((tool) => tool.name),
+      ttfbMs,
+      timestampIso: new Date().toISOString(),
+      language: payload.language,
+    });
+
+    await this.enqueueAudio(payload.audio);
+    logger.info('voice', 'audio_turn_complete', {
+      sessionId,
+      participantIdentity: participant.identity,
+      ttfbMs,
+      responsePreview: payload.responseText.slice(0, 200),
+      audioBytes: payload.audio.byteLength,
+    });
+  }
+
+  private async greet(participant: Participant): Promise<void> {
+    if (!this.room?.localParticipant) return;
+    logger.info('voice', 'greeting_start', {
+      room: this.room.name,
+      participantIdentity: participant.identity,
+    });
+    const language = normalizeLanguage(participant.attributes?.language) || 'en';
+    const turn: Pick<TurnPayload, 'responseText' | 'language'> & { toolCalls: TurnPayload['toolCalls'] } = {
+      responseText: greetingPrompt(language),
+      language,
+      toolCalls: [],
+    };
+
+    await this.room.localParticipant.sendChatMessage(turn.responseText, [participant.identity]);
+    logger.info('voice', 'greeting_chat_sent', {
+      room: this.room.name,
+      participantIdentity: participant.identity,
+      responsePreview: turn.responseText.slice(0, 200),
+    });
+    await this.publishTrace({
+      kind: 'greeting',
+      sessionId: `${this.room.name}:${participant.identity}`,
+      patientId: participant.identity,
+      transcript: '',
+      normalizedTranscript: '',
+      responseText: turn.responseText,
+      toolCalls: turn.toolCalls.map((tool) => tool.name),
+      ttfbMs: undefined,
+      timestampIso: new Date().toISOString(),
+      language: turn.language,
+    });
+
+    const audio = await synthesizeSpeech(turn.responseText, turn.language);
+    await this.enqueueAudio(audio);
+    logger.info('voice', 'greeting_audio_played', {
+      room: this.room.name,
+      participantIdentity: participant.identity,
+      audioBytes: audio.byteLength,
+    });
+  }
+
+  private enqueueAudio(ttsBuffer: Uint8Array): Promise<void> {
+    const task = this.playbackChain.then(() => this.playAudio(ttsBuffer));
+    this.playbackChain = task
+      .catch((error) => {
+        logger.warn('voice', 'playback_failed', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      })
+      .then(() => undefined);
+    return task;
+  }
+
+  private async playAudio(ttsBuffer: Uint8Array): Promise<void> {
     this.agentPlaying = true;
     try {
-      if (ttsBuffer.length === 0) return;
+      if (!ttsBuffer.length || !this.audioSource) return;
+      logger.debug('voice', 'play_audio_start', { bytes: ttsBuffer.byteLength });
       const wav = new WaveFile(ttsBuffer);
       wav.toSampleRate(24000);
       wav.toBitDepth('16');
       const samples = wav.getSamples(false, Int16Array) as unknown as Int16Array;
-
-      const frame = new AudioFrame(samples, 24000, 1, samples.length);
-      await this.audioSource?.captureFrame(frame);
-    } catch (e) {
-      console.error("Error decoding or playing audio:", e);
+      await this.audioSource.captureFrame(new AudioFrame(samples, 24000, 1, samples.length));
+      await this.audioSource.waitForPlayout();
+      logger.debug('voice', 'play_audio_complete', { samples: samples.length });
+    } catch (error) {
+      logger.error('voice', 'play_audio_error', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
     } finally {
       this.agentPlaying = false;
     }
   }
 
-  async processAudioTurn(audio: Uint8Array, sessionId: string, patientId: string): Promise<VoiceTurnResult> {
-    resetLatencyMarks();
-    markSpeechEnd(Date.now());
-
-    const transcription = await transcribeAudio(audio);
-    const orchestration = await runOrchestrationTurn({
-      sessionId,
-      patientId,
-      userText: transcription.text,
-      language: transcription.language,
+  private framesToWav(frames: AudioFrame[]): Uint8Array {
+    logger.debug('voice', 'frames_to_wav', {
+      frames: frames.length,
+      sampleRate: frames[0]?.sampleRate || null,
     });
-
-    const synthesizedAudio = await synthesizeSpeech(orchestration.responseText, orchestration.language);
-    markFirstAudioByte(Date.now());
-
-    return {
-      transcript: transcription.text,
-      responseText: orchestration.responseText,
-      audio: synthesizedAudio,
-    };
-  }
-
-
-  private async handleChatMessage(text: string, participant?: Participant): Promise<void> {
-    if (!participant || !this.room?.localParticipant || !text.trim()) {
-      return;
+    const totalSamples = frames.reduce((sum, frame) => sum + frame.data.byteLength / 2, 0);
+    const combined = new Int16Array(totalSamples);
+    let offset = 0;
+    for (const frame of frames) {
+      const pcm16 = new Int16Array(frame.data.buffer, frame.data.byteOffset, frame.data.byteLength / 2);
+      combined.set(pcm16, offset);
+      offset += pcm16.length;
     }
 
-    if (participant.identity === this.room.localParticipant.identity) {
-      return;
-    }
-
-    const sessionId = `${this.room.name}:${participant.identity}`;
-    const patientId = participant.identity;
-
-    const orchestration = await runOrchestrationTurn({
-      sessionId,
-      patientId,
-      userText: text,
-      language: participant.attributes?.language,
-    });
-
-    await this.room.localParticipant.sendChatMessage(orchestration.responseText, [participant.identity]);
+    const wav = new WaveFile();
+    wav.fromScratch(1, frames[0].sampleRate, '16', combined);
+    return wav.toBuffer();
   }
 
-  private async triggerGreeting(participant: Participant) {
+  private async publishTrace(payload: unknown): Promise<void> {
+    if (!this.room?.localParticipant) return;
+    logger.debug('voice', 'publish_trace', { room: this.room.name, payload });
+    await this.room.localParticipant.publishData(new TextEncoder().encode(JSON.stringify(payload)), {
+      reliable: true,
+      topic: 'maya.trace',
+    });
+  }
+
+  private async askToRepeat(participant: Participant, language: 'en' | 'hi' | 'ta', source: 'audio' | 'text'): Promise<void> {
     if (!this.room?.localParticipant) return;
 
-    const sessionId = `${this.room.name}:${participant.identity}`;
-    const patientId = participant.identity;
+    const responseByLanguage: Record<'en' | 'hi' | 'ta', string> = {
+      en: 'Sorry, I did not catch that. Please repeat once more.',
+      hi: 'माफ़ कीजिए, मैं ठीक से सुन नहीं पाई। कृपया एक बार फिर बोलिए।',
+      ta: 'மன்னிக்கவும், நான் தெளிவாக கேட்கவில்லை. தயவுசெய்து மீண்டும் சொல்லுங்கள்.',
+    };
+    const responseText = responseByLanguage[language];
 
-    console.log(`[Audio Pipeline] Triggering initial vocal greeting...`);
-    const orchestration = await runOrchestrationTurn({
-      sessionId,
-      patientId,
-      userText: "System: The user just joined. Greet them EXACTLY with the phrase 'Hello there, this is Maya speaking are you here for a clinical-appointment.' and nothing else. Keep it simple and friendly.",
+    logger.info('voice', 'repeat_requested', {
+      room: this.room.name,
+      participantIdentity: participant.identity,
+      source,
+      language,
+      responsePreview: responseText,
     });
 
-    await this.room.localParticipant.sendChatMessage(orchestration.responseText, [participant.identity]);
-
-    console.log(`[Audio Pipeline] Synthesizing greeting audio...`);
-    const synthesizedAudio = await synthesizeSpeech(orchestration.responseText, orchestration.language);
-
-    console.log(`[Audio Pipeline] Playing greeting audio...`);
-    await this.playAudio(synthesizedAudio);
+    await this.room.localParticipant.sendChatMessage(responseText, [participant.identity]);
+    const speech = await synthesizeSpeech(responseText, language);
+    await this.enqueueAudio(speech);
   }
+}
 
-  private extractTranscriptFromData(payload: Uint8Array, topic?: string): string | null {
-    if (topic && !topic.includes('transcript') && !topic.includes('text') && !topic.includes('chat')) {
-      return null;
-    }
+function normalizeLanguage(language?: string): 'en' | 'hi' | 'ta' {
+  if (language === 'hi' || language === 'ta' || language === 'en') return language;
+  return 'en';
+}
 
-    const raw = new TextDecoder().decode(payload).trim();
-    if (!raw) {
-      return null;
-    }
-
-    try {
-      const parsed = JSON.parse(raw) as { text?: string; message?: string };
-      return parsed.text?.trim() ?? parsed.message?.trim() ?? null;
-    } catch {
-      return raw;
-    }
-  }
+function isLowValueTranscript(text: string, confidence?: number): boolean {
+  const normalized = text.trim().toLowerCase();
+  if (!normalized) return true;
+  if (/^(noise|noisy|unknown|silence|inaudible|um+|uh+|hmm+)$/.test(normalized)) return true;
+  if (normalized.length < 2) return true;
+  if (typeof confidence === 'number' && confidence < 0.55) return true;
+  return false;
 }
