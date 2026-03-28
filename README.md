@@ -24,6 +24,40 @@ This repository contains a clean TypeScript implementation for the engineering a
 - **Why two memory layers:** Session memory handles in-progress dialogue state; long-term memory stores patient history and preferences across calls. This separation prevents prompt bloat and keeps retrieval scoped.
 - **Why trace-first orchestration:** Every tool decision is logged so behavior is explainable during demo and review, not treated as a black box.
 
+
+## Current Architecture
+
+```txt
+.
+├── README.md
+├── package.json
+├── .env
+└── src
+    ├── main.ts
+    ├── runtime
+    │   └── voiceAgent.ts
+    ├── orchestration
+    │   ├── orchestrator.ts
+    │   ├── intentRouter.ts
+    │   └── dialogueManager.ts
+    ├── services
+    │   ├── stt.ts
+    │   ├── tts.ts
+    │   └── llm.ts
+    ├── tools
+    │   ├── getPatientProfile.ts
+    │   ├── getScheduleOptions.ts
+    │   └── manageAppointment.ts
+    ├── memory
+    │   ├── sessionMemory.ts
+    │   └── longTermMemory.ts
+    ├── config
+    │   └── prompts.ts
+    └── telemetry
+        ├── latency.ts
+        └── traces.ts
+```
+
 ```mermaid
 flowchart LR
   U["User / Patient"] --> P["LiveKit Agents Playground<br/>or local UI"]
@@ -96,40 +130,6 @@ flowchart LR
   C --> OR
 
 ```
-
-## Current Architecture
-
-```txt
-.
-├── README.md
-├── package.json
-├── .env
-└── src
-    ├── main.ts
-    ├── runtime
-    │   └── voiceAgent.ts
-    ├── orchestration
-    │   ├── orchestrator.ts
-    │   ├── intentRouter.ts
-    │   └── dialogueManager.ts
-    ├── services
-    │   ├── stt.ts
-    │   ├── tts.ts
-    │   └── llm.ts
-    ├── tools
-    │   ├── getPatientProfile.ts
-    │   ├── getScheduleOptions.ts
-    │   └── manageAppointment.ts
-    ├── memory
-    │   ├── sessionMemory.ts
-    │   └── longTermMemory.ts
-    ├── config
-    │   └── prompts.ts
-    └── telemetry
-        ├── latency.ts
-        └── traces.ts
-```
-
 ## End-to-End Flow
 
 1. Audio arrives in `voiceAgent`
