@@ -1,23 +1,19 @@
-# Real-Time Multilingual Voice AI Agent (Clinical Appointment Booking)
+# Maya - Real-Time Multilingual Voice AI Agent
 
-This repository contains a clean TypeScript implementation for the engineering assignment:
-- Real-time voice pipeline for appointment booking workflows
-- Multilingual handling (English, Hindi, Tamil)
-- Session + long-term memory
-- Tool-driven orchestration with visible traces
+Clinical appointment booking agent for English, Hindi, and Tamil voice conversations.
 
-## Assignment Scope Covered
+## What this repo does
 
-- Booking, rescheduling, and cancellation via a single orchestrator
-- Intent routing + dialogue state management
-- Three core tools only:
-  - `getPatientProfile`
-  - `getScheduleOptions`
-  - `manageAppointment`
-- Latency instrumentation from speech-end to first-audio-byte
-- Trace logging for agent/tool reasoning visibility
+This project is a full assignment-ready voice agent built around LiveKit:
+- Inbound voice conversations through the LiveKit room
+- Automatic Maya dispatch when a user joins the room
+- Multilingual STT, orchestration, and TTS
+- Session memory plus persistent long-term memory
+- Conflict-aware appointment booking, rescheduling, and cancellation
+- Visible reasoning traces and latency logging
+- A polished LiveKit Playground-style web UI
 
-## Engineering Decisions (Why This Design)
+## Architecture
 
 - **Why single orchestrator (not multi-agent):** For this assignment, the core problem is low-latency appointment execution, not open-ended task delegation. A single orchestrator avoids cross-agent handoff overhead and makes turn behavior deterministic and debuggable.
 - **Why exactly 3 tools:** The appointment domain can be reduced to identity/context (`getPatientProfile`), options (`getScheduleOptions`), and state mutation (`manageAppointment`). This keeps tool contracts minimal while covering booking, rescheduling, cancellation, and conflict recovery.
@@ -130,107 +126,145 @@ flowchart LR
   C --> OR
 
 ```
-## End-to-End Flow
 
-1. Audio arrives in `voiceAgent`
-2. `stt.ts` converts speech to text + language hint
-3. `orchestrator.ts` routes intent and manages state
-4. Orchestrator calls tools as needed
-5. `llm.ts` formats final assistant response
-6. `tts.ts` synthesizes response audio
-7. `telemetry/latency.ts` and `telemetry/traces.ts` capture runtime evidence
+## Flow
 
-## Orchestrator Decision Logic
-
-The orchestrator runs this policy on every turn:
-
-```txt
-if intent == book:
-  profile = getPatientProfile(patientId)
-  options = getScheduleOptions(profile/context)
-  if slot resolvable:
-    manageAppointment(book, slotId, patientId)
-  else:
-    ask clarification / offer alternatives
-
-if intent == reschedule:
-  profile = getPatientProfile(patientId)
-  options = getScheduleOptions(profile/context)
-  manageAppointment(reschedule, slotId, patientId) when confirmed
-
-if intent == cancel:
-  manageAppointment(cancel, patientId)
+```mermaid
+flowchart LR
+  A[LiveKit Playground or local UI] --> B[/api/token/]
+  B --> C[LiveKit room token with roomConfig.agents]
+  C --> D[Maya worker joins room]
+  D --> E[Audio capture + VAD]
+  E --> F[Sarvam STT]
+  F --> G[Anthropic tool-calling orchestration]
+  G --> H[Clinic store + tools]
+  H --> I[Sarvam TTS]
+  I --> D
+  G --> J[Reasoning traces + latency logs]
 ```
 
-All branches emit a reasoning trace with intent, tool calls, and response summary.
+1. You request a token from `src/server.ts`.
+2. The token includes `roomConfig.agents`, so Maya is dispatched when the participant joins.
+3. The worker in `src/main.ts` connects to the room and starts the voice runtime.
+4. `src/runtime/voiceAgent.ts` listens to audio, detects speech, sends it to STT, and passes the transcript to orchestration.
+5. `src/orchestration/orchestrator.ts` routes intent, calls tools, and generates the final response.
+6. TTS synthesizes the response, and Maya speaks it back into the room.
 
-## Handling Real-World Messiness
+## Memory
 
-Example: user changes mind mid-conversation
+The assignment asks for memory at two levels:
 
-- **Turn 1:** "Book for tomorrow morning."
-- **System state:** intent=`book`, date=`tomorrow`, awaiting slot confirmation.
-- **Turn 2:** "Actually Friday evening."
-- **Behavior:** intent remains booking, prior slot/date state is overwritten, fresh availability is fetched, and new options are proposed.
+- Session memory is stored in `data/clinic-store.json` and updated per room/session.
+- Long-term memory stores patient profiles, preferences, and interaction summaries across sessions.
 
-This behavior is managed in `dialogueManager.ts` (state updates) and `orchestrator.ts` (tool re-invocation).
+This repo keeps that memory in a persistent JSON store for clarity and easy demoability. The design is easy to swap to Redis or MongoDB later.
 
-## Multilingual Behavior
+## Scheduling and conflict logic
 
-- STT produces text plus language hint (`en`/`hi`/`ta`).
-- Intent routing uses text semantics independent of language hint.
-- Active language is carried through the turn and passed to TTS.
-- Preferred language can be persisted in long-term memory for returning patients.
-- Mid-conversation language switch is handled by updating session language from latest turn.
+The clinic tools enforce:
+- No booking into the past
+- No double-booking
+- No booking into reserved slots
+- Reschedule and cancel flows update both appointments and slot availability
 
-## Latency Measurement
+The available slots are seeded in the store and filtered by doctor, date, and availability.
 
-Latency is measured as **speech-end -> first-audio-byte** using runtime timestamps in `src/telemetry/latency.ts`.
+## Multilingual behavior
 
-- `markSpeechEnd()` is called before STT/orchestration.
-- `markFirstAudioByte()` is called once TTS output is produced.
-- The delta is recorded for each turn and can be reported in the demo.
+Language is detected from input text and can persist per patient:
+- English
+- Hindi
+- Tamil
 
-## Environment Variables
+The worker keeps the language in session memory and passes it into the response pipeline and TTS.
 
-Create `.env` with:
+## Latency
+
+The worker logs speech end to first audio byte latency on every voice turn. That measurement is emitted in the reasoning trace and can be discussed in the walkthrough.
+
+## Environment
+
+Use `.env` at the repo root:
 
 ```bash
 LIVEKIT_URL=
 LIVEKIT_API_KEY=
 LIVEKIT_API_SECRET=
 LIVEKIT_ROOM=clinical-appointments
+LIVEKIT_AGENT_NAME=maya
+PORT=8787
+SARVAM_API_KEY=
+ANTHROPIC_API_KEY=
+ANTHROPIC_MODEL=claude-haiku-4-5
+ANTHROPIC_MAX_TOKENS=700
+ANTHROPIC_TEMPERATURE=0.2
 ```
 
-## Run / Check
-
-Current scripts in `package.json`:
+## Setup
 
 ```bash
-pnpm check
+pnpm install
 pnpm build
-pnpm start
 ```
 
-## Engineering Notes and Tradeoffs
+## Run
 
-- **Simple over complex:** Single orchestrator instead of multi-agent fragmentation
-- **Deterministic over clever:** Explicit branch policies for appointment lifecycle reduce ambiguity
-- **Tool-first behavior:** Appointment actions happen through explicit tool calls
-- **Scalable path:** Services and memory are isolated so provider/store swaps are straightforward
-- **Low-latency focus:** Minimal call chain with instrumentation points around STT/orchestration/TTS
+Start the worker:
 
-## Known Limitations (Current Snapshot)
+```bash
+pnpm start:worker
+```
 
-- External provider integrations are lightweight stubs and should be replaced with production SDK/API clients.
-- Outbound campaign scheduling is not included in this reduced structure.
-- Conflict logic can be expanded with richer scheduling constraints and retries.
+Start the token / dispatch server:
 
-## Submission Checklist Mapping
+```bash
+pnpm start:server
+```
 
-- **Architecture quality:** clear separation across runtime/orchestration/services/tools/memory
-- **Agentic orchestration:** centralized in `src/orchestration/orchestrator.ts`
-- **Memory design:** session in `sessionMemory.ts`, long-term in `longTermMemory.ts`
-- **Latency evidence:** `src/telemetry/latency.ts`
-- **Reasoning visibility:** `src/telemetry/traces.ts`
+Start the local web demo:
 
+```bash
+pnpm dev:web
+```
+
+Or run everything together:
+
+```bash
+pnpm dev
+```
+
+## LiveKit Playground demo flow
+
+1. Start `pnpm start:worker` and `pnpm start:server`.
+2. Request a token:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8787/api/token \
+  -H 'content-type: application/json' \
+  -d "{\"room\":\"$LIVEKIT_ROOM\",\"name\":\"You\",\"identity\":\"you\"}"
+```
+
+3. Open the LiveKit Playground and connect with the returned `url` and `token`.
+4. Maya is dispatched automatically through `roomConfig.agents`.
+5. Speak in English, Hindi, or Tamil and Maya will answer in voice.
+
+## Local demo UI
+
+Open `http://localhost:5173` to use the bundled Playground-style UI.
+
+## Notes on outbound campaigns
+
+The repo includes the plumbing for campaign-aware orchestration and room dispatch metadata. If you want to extend it to actual telephony later, the `campaigns` store and dispatch endpoints are the right expansion point.
+
+## Tradeoffs
+
+- JSON-backed memory is simpler and more transparent than Redis for a demo.
+- Anthropic tool-calling keeps the orchestration genuine and inspectable.
+- Sarvam is used for the STT/TTS path because it is lightweight and fast to validate locally.
+- The UI prioritizes debug visibility over visual minimalism.
+
+## Known limitations
+
+- Outbound telephony is not fully integrated yet.
+- LiveKit room tokens are created server-side and should be protected in production.
+- The clinic store is intentionally simple and should move to Redis or a database for scale.
